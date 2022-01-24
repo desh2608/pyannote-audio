@@ -113,6 +113,7 @@ class OverlappedSpeechDetection(Pipeline):
         segmentation: PipelineModel = "pyannote/segmentation",
         precision: Optional[float] = None,
         recall: Optional[float] = None,
+        device: str = "cuda",
         **inference_kwargs,
     ):
         super().__init__()
@@ -120,10 +121,7 @@ class OverlappedSpeechDetection(Pipeline):
         self.segmentation = segmentation
 
         # load model and send it to GPU (when available and not already on GPU)
-        model = get_model(segmentation)
-        if model.device.type == "cpu":
-            (segmentation_device,) = get_devices(needs=1)
-            model.to(segmentation_device)
+        model = get_model({"checkpoint": segmentation, "map_location": device})
 
         if model.introspection.dimension > 1:
             inference_kwargs["pre_aggregation_hook"] = lambda scores: np.partition(
@@ -197,7 +195,7 @@ class OverlappedSpeechDetection(Pipeline):
         overlapped_speech = self._binarize(file[self.CACHED_ACTIVATIONS])
         overlapped_speech.uri = file["uri"]
         return overlapped_speech.rename_labels(
-            {label: "OVERLAP" for label in overlapped_speech.labels()}
+            {label: "overlap" for label in overlapped_speech.labels()}
         )
 
     def get_metric(self, **kwargs) -> DetectionPrecisionRecallFMeasure:
