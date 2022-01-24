@@ -807,7 +807,8 @@ class Model(pl.LightningModule):
                     use_auth_token=use_auth_token,
                 )
             except Exception:
-                pass
+                msg = "No config file found for model"
+                warnings.warn(msg)
 
         if map_location is None:
 

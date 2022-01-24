@@ -107,6 +107,7 @@ class VoiceActivityDetection(Pipeline):
         self,
         segmentation: PipelineModel = "pyannote/segmentation",
         fscore: bool = False,
+        device: str = "cuda",
         **inference_kwargs,
     ):
         super().__init__()
@@ -115,10 +116,7 @@ class VoiceActivityDetection(Pipeline):
         self.fscore = fscore
 
         # load model and send it to GPU (when available and not already on GPU)
-        model = get_model(segmentation)
-        if model.device.type == "cpu":
-            (segmentation_device,) = get_devices(needs=1)
-            model.to(segmentation_device)
+        model = get_model({"checkpoint": segmentation, "map_location": device})
 
         inference_kwargs["pre_aggregation_hook"] = lambda scores: np.max(
             scores, axis=-1, keepdims=True
