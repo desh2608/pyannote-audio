@@ -2,6 +2,35 @@
 Changelog
 #########
 
+Version 2.1 (2022-11-xx)
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+  - BREAKING(pipeline): rewrite speaker diarization pipeline
+  - feat(pipeline): add option to optimize for DER variant
+  - feat(clustering): add support for NeMo speaker embedding
+  - feat(clustering): add FINCH clustering
+  - feat(clustering): add min_cluster_size hparams to AgglomerativeClustering
+  - feat(hub): add support for private/gated models
+  - setup(hub): switch to latest hugginface_hub API
+  - fix(pipeline): fix support for missing reference in Resegmentation pipeline
+  - fix(clustering) fix corner case where HMM.fit finds too little states
+
+Version 2.0.1 (2022-07-20)
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  - BREAKING: complete rewrite
+  - feat: much better performance
+  - feat: Python-first API
+  - feat: pretrained pipelines (and models) on Huggingface model hub
+  - feat: multi-GPU training with pytorch-lightning
+  - feat: data augmentation with torch-audiomentations
+  - feat: Prodigy recipe for model-assisted audio annotation
+
+Version 1.1.2 (2021-01-28)
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  - fix: make sure master branch is used to load pretrained models (#599)
+
 Version 1.1 (2020-11-08)
 ~~~~~~~~~~~~~~~~~~~~~~~~
 

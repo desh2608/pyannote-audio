@@ -7,26 +7,30 @@
 </p>
 
 
-## TL;DR
+## TL;DR [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pyannote/pyannote-audio/blob/develop/tutorials/intro.ipynb)
+
 
 ```python
-# instantiate pretrained speaker diarization pipeline
+# 1. visit hf.co/pyannote/speaker-diarization and accept user conditions (only if requested)
+# 2. visit hf.co/settings/tokens to create an access token (only if you had to go through 1.)
+# 3. instantiate pretrained speaker diarization pipeline
 from pyannote.audio import Pipeline
-pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization")
+pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization",
+                                    use_auth_token="ACCESS_TOKEN_GOES_HERE")
 
-# apply pretrained pipeline
+# 4. apply pretrained pipeline
 diarization = pipeline("audio.wav")
 
-# print the result
+# 5. print the result
 for turn, _, speaker in diarization.itertracks(yield_label=True):
     print(f"start={turn.start:.1f}s stop={turn.end:.1f}s speaker_{speaker}")
-# start=0.2s stop=1.5s speaker_A
-# start=1.8s stop=3.9s speaker_B
-# start=4.2s stop=5.7s speaker_A
+# start=0.2s stop=1.5s speaker_0
+# start=1.8s stop=3.9s speaker_1
+# start=4.2s stop=5.7s speaker_0
 # ...
 ```
 
-## What's new in `pyannote.audio` 2.0
+## What's new in `pyannote.audio` 2.x?
 
 For version 2.x of `pyannote.audio`, [I](https://herve.niderb.fr) decided to rewrite almost everything from scratch.
 Highlights of this release are:
@@ -36,25 +40,26 @@ Highlights of this release are:
 - :hugs: pretrained [pipelines](https://hf.co/models?other=pyannote-audio-pipeline) (and [models](https://hf.co/models?other=pyannote-audio-model)) on [:hugs: model hub](https://huggingface.co/pyannote)
 - :zap: multi-GPU training with [pytorch-lightning](https://pytorchlightning.ai/)
 - :control_knobs: data augmentation with [torch-audiomentations](https://github.com/asteroid-team/torch-audiomentations)
+- :boom: [Prodigy](https://prodi.gy/) recipes for model-assisted audio annotation
 
 ## Installation
 
+Only Python 3.8+ is officially supported (though it might work with Python 3.7)
+
 ```bash
-conda create -n pyannote python=3.8.5
+conda create -n pyannote python=3.8
 conda activate pyannote
-conda install pytorch torchaudio -c pytorch
 
-# pyannote.audio relies on torchaudio's soundfile backend,
-# itself relying on libsndfile, sometimes tricky to install.
-# This seems to work fine but is provided with no guarantee of success:
-conda install numpy cffi
-conda install libsndfile=1.0.28 -c conda-forge
+# pytorch 1.11 is required for speechbrain compatibility
+# (see https://pytorch.org/get-started/previous-versions/#v1110)
+conda install pytorch==1.11.0 torchvision==0.12.0 torchaudio==0.11.0 -c pytorch
 
-pip install https://github.com/pyannote/pyannote-audio/archive/develop.zip
+pip install -qq https://github.com/pyannote/pyannote-audio/archive/develop.zip
 ```
 
 ## Documentation
 
+- [Changelog](CHANGELOG.md)
 - Models
     - Available tasks explained
     - [Applying a pretrained model](tutorials/applying_a_model.ipynb)
@@ -68,46 +73,73 @@ pip install https://github.com/pyannote/pyannote-audio/archive/develop.zip
     - [Adding a new task](tutorials/add_your_own_task.ipynb)
     - Adding a new pipeline
     - Sharing pretrained models and pipelines
+- Blog
+    - 2022-10-23 > ["One speaker segmentation model to rule them all"](https://herve.niderb.fr/fastpages/2022/10/23/One-speaker-segmentation-model-to-rule-them-all)
+    - 2021-08-05 > ["Streaming voice activity detection with pyannote.audio"](https://herve.niderb.fr/fastpages/2021/08/05/Streaming-voice-activity-detection-with-pyannote.html)
 - Miscellaneous
+    - [Training with `pyannote-audio-train` command line tool](tutorials/training_with_cli.md)
+    - [Annotating your own data with Prodigy](tutorials/prodigy.md)
     - [Speaker verification](tutorials/speaker_verification.ipynb)
     - Visualization and debugging
 
+## Frequently asked questions
+
+#### How does one capitalize and pronounce the name of this awesome library?
+
+📝 Written in lower case: `pyannote.audio` (or `pyannote` if you are lazy).  Not `PyAnnote` nor `PyAnnotate` (*sic*).
+📢 [Pronounced](https://www.howtopronounce.com/french/pianote) like the french verb *pianoter*.  *pi* like in **pi**ano, not *py* like in **py**thon.
+🎹 *pianoter* means *to play the piano* (hence the logo 🤯).
+
+#### **[Pretrained pipelines](https://huggingface.co/models?other=pyannote-audio-pipeline) do not produce good results on my data. What can I do?**
+
+1. [Annotate](https://github.com/pyannote/pyannote-audio/blob/develop/tutorials/prodigy.md) dozens of conversations manually and separate them into development and test subsets in [`pyannote.database`](https://github.com/pyannote/pyannote-database#speaker-diarization).
+2. [Optimize the hyper-parameters](https://github.com/pyannote/pyannote-audio/blob/develop/tutorials/voice_activity_detection.ipynb) of the pretained pipeline using the development set. If performance is still not good enough, go to step 3.
+3. Annotate hundreds of conversations manually and set them up as training subset in `pyannote.database`.
+4. [Fine-tune](https://github.com/pyannote/pyannote-audio/blob/develop/tutorials/training_a_model.ipynb) the models (on which the pipeline relies) using the training set.
+5. [Optimize the hyper-parameters](https://github.com/pyannote/pyannote-audio/blob/develop/tutorials/voice_activity_detection.ipynb) of the pipeline using the fine-tuned models using the development set. If performance is still not good enough, go back to step 3.
+
+
 ## Benchmark
 
-The pretrained speaker diarization pipeline with default parameters is expected to be much better in v2.0 than in v1.1:
+Out of the box, `pyannote.audio` default speaker diarization [pipeline](https://hf.co/pyannote/speaker-diarization) is expected to be much better (and faster) in v2.x than in v1.1. Those numbers are diarization error rates (in %)
 
-| [Diarization error rate](http://pyannote.github.io/pyannote-metrics/reference.html#diarization) (%) | v1.1 | v2.0 | ∆DER |
-| --------------------------------------------------------------------------------------------------- | ---- | ---- | ---- |
-| [AMI `only_words` evaluation set](https://github.com/BUTSpeechFIT/AMI-diarization-setup)            | 29.7 | 21.3 | -28% |
-| [DIHARD 3 evaluation set](https://arxiv.org/abs/2012.01477)                                         | 29.2 | 22.2 | -24% |
-| [VoxConverse 0.0.2 evaluation set](https://github.com/joonson/voxconverse)                          | 21.5 | 13.0 | -39% |
+| Dataset \ Version      | v1.1 | v2.0 | v2.1.1 (finetuned) |
+| ---------------------- | ---- | ---- | ------------------ |
+| AISHELL-4              | -    | 14.6 | 14.1 (14.5)        |
+| AliMeeting (channel 1) | -    | -    | 27.4 (23.8)        |
+| AMI (IHM)              | 29.7 | 18.2 | 18.9 (18.5)        |
+| AMI (SDM)              | -    | 29.0 | 27.1 (22.2)        |
+| CALLHOME (part2)       | -    | 30.2 | 32.4 (29.3)        |
+| DIHARD 3 (full)        | 29.2 | 21.0 | 26.9 (21.9)        |
+| VoxConverse (v0.3)     | 21.5 | 12.6 | 11.2 (10.7)        |
+| REPERE (phase2)        | -    | 12.6 | 8.2 ( 8.3)         |
+| This American Life     | -    | -    | 20.8 (15.2)        |
 
-Here is the (pseudo-)code used to obtain those numbers:
+## Citations
 
-```python
-# v1.1
-import torch
-pipeline = torch.hub.load("pyannote/pyannote-audio", "dia")
-diarization = pipeline({"audio": "audio.wav"})
+If you use `pyannote.audio` please use the following citations:
 
-# v2.0
-from pyannote.audio import Pipeline
-pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization")
-diarization = pipeline("audio.wav")
+```bibtex
+@inproceedings{Bredin2020,
+  Title = {{pyannote.audio: neural building blocks for speaker diarization}},
+  Author = {{Bredin}, Herv{\'e} and {Yin}, Ruiqing and {Coria}, Juan Manuel and {Gelly}, Gregory and {Korshunov}, Pavel and {Lavechin}, Marvin and {Fustes}, Diego and {Titeux}, Hadrien and {Bouaziz}, Wassim and {Gill}, Marie-Philippe},
+  Booktitle = {ICASSP 2020, IEEE International Conference on Acoustics, Speech, and Signal Processing},
+  Year = {2020},
+}
+```
 
-# evaluation
-from pyannote.metrics.diarization import DiarizationErrorRate
-metric = DiarizationErrorRate(collar=0.0, skip_overlap=False)
-for audio, reference in evaluation_set:  # pseudo-code
-    diarization = pipeline(audio)
-    _ = metric(reference, diarization)
-der = abs(metric)
+```bibtex
+@inproceedings{Bredin2021,
+  Title = {{End-to-end speaker segmentation for overlap-aware resegmentation}},
+  Author = {{Bredin}, Herv{\'e} and {Laurent}, Antoine},
+  Booktitle = {Proc. Interspeech 2021},
+  Year = {2021},
+}
 ```
 
 ## Support
 
 For commercial enquiries and scientific consulting, please contact [me](mailto:herve@niderb.fr).
-
 
 ## Development
 

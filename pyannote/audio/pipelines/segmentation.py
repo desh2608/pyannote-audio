@@ -22,29 +22,30 @@
 
 """Speaker segmentation pipeline"""
 
-from typing import Callable, Optional
 import math
-import numpy as np
+from typing import Callable, Optional, Text, Union
+
 import networkx as nx
+import numpy as np
 from pyannote.core import SlidingWindowFeature
 from pyannote.pipeline.parameter import Uniform
 
-from pyannote.audio.core.pipeline import Pipeline
 from pyannote.audio.core.inference import Inference
-from pyannote.audio.core.model import Model
 from pyannote.audio.core.io import AudioFile
+from pyannote.audio.core.model import Model
+from pyannote.audio.core.pipeline import Pipeline
 from pyannote.audio.pipelines.utils import (
     PipelineModel,
     SpeakerDiarizationMixin,
     get_devices,
     get_model,
 )
-from pyannote.audio.utils.signal import binarize
 from pyannote.audio.utils.metric import (
     DiscreteDiarizationErrorRate,
     SlidingDiarizationErrorRate,
 )
 from pyannote.audio.utils.permutation import mae_cost_func, permutate
+from pyannote.audio.utils.signal import binarize
 
 
 class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
@@ -59,6 +60,10 @@ class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
         Skip final conversion to pyannote.core.Annotation. Defaults to False.
     skip_stitching : bool, optional
         Skip stitching step. Defaults to False
+    use_auth_token : str, optional
+        When loading private huggingface.co models, set `use_auth_token`
+        to True or to a string containing your hugginface.co authentication
+        token that can be obtained by running `huggingface-cli login`
 
     Hyper-parameters
     ----------------
@@ -80,6 +85,7 @@ class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
         segmentation: PipelineModel = "pyannote/segmentation",
         skip_conversion: bool = False,
         skip_stitching: bool = False,
+        use_auth_token: Union[Text, None] = None,
     ):
         super().__init__()
 
@@ -87,7 +93,7 @@ class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
         self.skip_stitching = skip_stitching
         self.skip_conversion = skip_conversion
 
-        model: Model = get_model(segmentation)
+        model: Model = get_model(segmentation, use_auth_token=use_auth_token)
         (device,) = get_devices(needs=1)
         model.to(device)
         self._segmentation = Inference(model)
@@ -126,19 +132,24 @@ class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
 
             if not (self.skip_stitching or self.skip_conversion):
                 parameters.update(
-                    {"min_duration_on": 0.0, "min_duration_off": 0.0,}
+                    {
+                        "min_duration_on": 0.0,
+                        "min_duration_off": 0.0,
+                    }
                 )
+
+            return parameters
 
         raise NotImplementedError()
 
-    CACHED_SEGMENTATION = "@segmentation/raw"
+    CACHED_SEGMENTATION = "cache/segmentation/inference"
 
     @staticmethod
     def get_stitching_graph(
         segmentations: SlidingWindowFeature, onset: float = 0.5
     ) -> nx.Graph:
         """Build stitching graph
-        
+
         Parameters
         ----------
         segmentations : (num_chunks, num_frames, local_num_speakers)-shaped SlidingWindowFeature
@@ -249,13 +260,16 @@ class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
 
         # apply segmentation model (only if needed)
         # output shape is (num_chunks, num_frames, local_num_speakers)
-        if (not self.training) or (
-            self.training and self.CACHED_SEGMENTATION not in file
-        ):
-            file[self.CACHED_SEGMENTATION] = self._segmentation(file)
+        if self.training:
+            if self.CACHED_SEGMENTATION in file:
+                segmentations = file[self.CACHED_SEGMENTATION]
+            else:
+                segmentations = self._segmentation(file)
+                file[self.CACHED_SEGMENTATION] = segmentations
+        else:
+            segmentations: SlidingWindowFeature = self._segmentation(file)
 
-        segmentations: SlidingWindowFeature = file[self.CACHED_SEGMENTATION]
-        hook(self.CACHED_SEGMENTATION, segmentations)
+        hook("segmentation", segmentations)
 
         if self.skip_stitching:
             return binarize(
@@ -270,13 +284,12 @@ class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
             warm_up=(self.warm_up, self.warm_up),
             frames=self._frames,
         )
-        hook("@segmentation/count", count)
+        hook("speaker_counting", count)
 
         # trim warm-up regions
         segmentations = Inference.trim(
             segmentations, warm_up=(self.warm_up, self.warm_up)
         )
-        hook("@segmentation/trim", segmentations)
 
         # build stitching graph
         stitching_graph = self.get_stitching_graph(segmentations, onset=self.onset)
@@ -303,7 +316,7 @@ class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
             stitched_segmentations, segmentations.sliding_window
         )
 
-        hook("@segmentation/stitch", stitched_segmentations)
+        hook("stitching", stitched_segmentations)
 
         # build discrete diarization
         discrete_diarization = self.to_diarization(stitched_segmentations, count)
@@ -316,7 +329,7 @@ class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
         if self.skip_conversion:
             return discrete_diarization
 
-        hook("@segmentation/diarization", discrete_diarization)
+        hook("aggregation", discrete_diarization)
 
         # convert to continuous diarization
         diarization = self.to_annotation(
@@ -345,4 +358,3 @@ class SpeakerSegmentation(SpeakerDiarizationMixin, Pipeline):
             )
 
         return SlidingDiarizationErrorRate(window=2.0 * self._segmentation.duration)
-

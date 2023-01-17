@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2020-2021 CNRS
+# Copyright (c) 2020- CNRS
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -23,24 +23,32 @@
 
 from __future__ import annotations
 
+from functools import partial
+
+try:
+    from functools import cached_property
+except ImportError:
+    from backports.cached_property import cached_property
+
 import multiprocessing
 import sys
 import warnings
 from dataclasses import dataclass
 from enum import Enum
 from numbers import Number
-from typing import List, Optional, Text, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Text, Tuple, Union
 
 import pytorch_lightning as pl
 import torch
+from pyannote.database import Protocol
 from torch.utils.data import DataLoader, Dataset, IterableDataset
-from torch.utils.data._utils.collate import default_collate
+from torch_audiomentations import Identity
 from torch_audiomentations.core.transforms_interface import BaseWaveformTransform
+from torchmetrics import Metric, MetricCollection
 from typing_extensions import Literal
 
 from pyannote.audio.utils.loss import binary_cross_entropy, nll_loss
 from pyannote.audio.utils.protocol import check_protocol
-from pyannote.database import Protocol
 
 
 # Type of machine learning problem
@@ -151,6 +159,9 @@ class Task(pl.LightningDataModule):
     augmentation : BaseWaveformTransform, optional
         torch_audiomentations waveform transform, used by dataloader
         during training.
+    metric : optional
+        Validation metric(s). Can be anything supported by torchmetrics.MetricCollection.
+        Defaults to value returned by `default_metric` method.
 
     Attributes
     ----------
@@ -168,6 +179,7 @@ class Task(pl.LightningDataModule):
         num_workers: int = None,
         pin_memory: bool = False,
         augmentation: BaseWaveformTransform = None,
+        metric: Union[Metric, Sequence[Metric], Dict[str, Metric]] = None,
     ):
         super().__init__()
 
@@ -202,7 +214,8 @@ class Task(pl.LightningDataModule):
 
         self.num_workers = num_workers
         self.pin_memory = pin_memory
-        self.augmentation = augmentation
+        self.augmentation = augmentation or Identity(output_type="dict")
+        self._metric = metric
 
     def prepare_data(self):
         """Use this to download and prepare data
@@ -233,9 +246,6 @@ class Task(pl.LightningDataModule):
     def setup_loss_func(self):
         pass
 
-    def setup_validation_metric(self):
-        pass
-
     def train__iter__(self):
         # will become train_dataset.__iter__ method
         msg = f"Missing '{self.__class__.__name__}.train__iter__' method."
@@ -246,13 +256,9 @@ class Task(pl.LightningDataModule):
         msg = f"Missing '{self.__class__.__name__}.train__len__' method."
         raise NotImplementedError(msg)
 
-    def collate_fn(self, batch):
-        collated_batch = default_collate(batch)
-        if self.augmentation is not None:
-            collated_batch["X"] = self.augmentation(
-                collated_batch["X"], sample_rate=self.model.hparams.sample_rate
-            )
-        return collated_batch
+    def collate_fn(self, batch, stage="train"):
+        msg = f"Missing '{self.__class__.__name__}.collate_fn' method."
+        raise NotImplementedError(msg)
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
@@ -261,8 +267,20 @@ class Task(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=True,
-            collate_fn=self.collate_fn,
+            collate_fn=partial(self.collate_fn, stage="train"),
         )
+
+    @cached_property
+    def logging_prefix(self):
+
+        prefix = f"{self.__class__.__name__}-"
+        if hasattr(self.protocol, "name"):
+            # "." has a special meaning for pytorch-lightning checkpointing
+            # so we remove dots from protocol names
+            name_without_dots = "".join(self.protocol.name.split("."))
+            prefix += f"{name_without_dots}-"
+
+        return prefix
 
     def default_loss(
         self, specifications: Specifications, target, prediction, weight=None
@@ -353,7 +371,7 @@ class Task(pl.LightningDataModule):
         # compute loss
         loss = self.default_loss(self.specifications, y, y_pred, weight=weight)
         self.model.log(
-            f"{self.ACRONYM}@{stage}_loss",
+            f"{self.logging_prefix}{stage.capitalize()}Loss",
             loss,
             on_step=False,
             on_epoch=True,
@@ -385,6 +403,7 @@ class Task(pl.LightningDataModule):
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
                 drop_last=False,
+                collate_fn=partial(self.collate_fn, stage="val"),
             )
         else:
             return None
@@ -396,6 +415,24 @@ class Task(pl.LightningDataModule):
 
     def validation_epoch_end(self, outputs):
         pass
+
+    def default_metric(self) -> Union[Metric, Sequence[Metric], Dict[str, Metric]]:
+        """Default validation metric"""
+        msg = f"Missing '{self.__class__.__name__}.default_metric' method."
+        raise NotImplementedError(msg)
+
+    @cached_property
+    def metric(self) -> MetricCollection:
+        if self._metric is None:
+            self._metric = self.default_metric()
+
+        return MetricCollection(self._metric, prefix=self.logging_prefix)
+
+    def setup_validation_metric(self):
+        metric = self.metric
+        if metric is not None:
+            self.model.validation_metric = metric
+            self.model.validation_metric.to(self.model.device)
 
     @property
     def val_monitor(self):
@@ -415,7 +452,6 @@ class Task(pl.LightningDataModule):
         pytorch_lightning.callbacks.ModelCheckpoint
         pytorch_lightning.callbacks.EarlyStopping
         """
-        if self.has_validation:
-            return f"{self.ACRONYM}@val_loss", "min"
-        else:
-            return None, "min"
+
+        name, metric = next(iter(self.metric.items()))
+        return name, "max" if metric.higher_is_better else "min"

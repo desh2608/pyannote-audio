@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2018-2021 CNRS
+# Copyright (c) 2018-2022 CNRS
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -22,9 +22,12 @@
 
 """Resegmentation pipeline"""
 
-from typing import Callable, Optional, Text
+from typing import Callable, Optional, Text, Union
 
 import numpy as np
+from pyannote.core import Annotation, Segment, SlidingWindowFeature
+from pyannote.metrics.diarization import GreedyDiarizationErrorRate
+from pyannote.pipeline.parameter import Uniform
 
 from pyannote.audio import Inference, Model
 from pyannote.audio.core.io import AudioFile
@@ -36,9 +39,6 @@ from pyannote.audio.pipelines.utils import (
     get_model,
 )
 from pyannote.audio.utils.permutation import mae_cost_func, permutate
-from pyannote.core import Annotation, Segment, SlidingWindowFeature
-from pyannote.metrics.diarization import GreedyDiarizationErrorRate
-from pyannote.pipeline.parameter import Uniform
 
 
 class Resegmentation(SpeakerDiarizationMixin, Pipeline):
@@ -51,6 +51,10 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
     Permutated local segmentations scores are then aggregated over time and postprocessed using
     hysteresis thresholding.
 
+    It can also be used with `diarization` set to "annotation" to find a good estimate of optimal
+    values for `onset`, `offset`, `min_duration_on`, and `min_duration_off` for any speaker
+    diarization pipeline based on the `segmentation` model.
+
     Parameters
     ----------
     segmentation : Model, str, or dict, optional
@@ -58,6 +62,14 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
         See pyannote.audio.pipelines.utils.get_model for supported format.
     diarization : str, optional
         File key to use as input diarization. Defaults to "diarization".
+    der_variant : dict, optional
+        Optimize for a variant of diarization error rate.
+        Defaults to {"collar": 0.0, "skip_overlap": False}. This is used in `get_metric`
+        when instantiating the metric: GreedyDiarizationErrorRate(**der_variant).
+    use_auth_token : str, optional
+        When loading private huggingface.co models, set `use_auth_token`
+        to True or to a string containing your hugginface.co authentication
+        token that can be obtained by running `huggingface-cli login`
 
     Hyper-parameters
     ----------------
@@ -73,6 +85,8 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
         self,
         segmentation: PipelineModel = "pyannote/segmentation",
         diarization: Text = "diarization",
+        der_variant: dict = None,
+        use_auth_token: Union[Text, None] = None,
     ):
 
         super().__init__()
@@ -80,7 +94,7 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
         self.segmentation = segmentation
         self.diarization = diarization
 
-        model: Model = get_model(segmentation)
+        model: Model = get_model(segmentation, use_auth_token=use_auth_token)
         (device,) = get_devices(needs=1)
         model.to(device)
         self._segmentation = Inference(model)
@@ -91,13 +105,16 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
         # number of speakers in output of segmentation model
         self._num_speakers = len(model.specifications.classes)
 
-        self.warm_up = 0.05
+        self.der_variant = der_variant or {"collar": 0.0, "skip_overlap": False}
 
-        #  hyper-parameters used for hysteresis thresholding
+        # segmentation warm-up
+        self.warm_up = Uniform(0.0, 0.1)
+
+        # hysteresis thresholding
         self.onset = Uniform(0.0, 1.0)
         self.offset = Uniform(0.0, 1.0)
 
-        # hyper-parameters used for post-processing i.e. removing short speech turns
+        # post-processing i.e. removing short speech turns
         # or filling short gaps between speech turns of one speaker
         self.min_duration_on = Uniform(0.0, 1.0)
         self.min_duration_off = Uniform(0.0, 1.0)
@@ -106,6 +123,7 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
         # parameters optimized on DIHARD 3 development set
         if self.segmentation == "pyannote/segmentation":
             return {
+                "warm_up": 0.05,
                 "onset": 0.810,
                 "offset": 0.481,
                 "min_duration_on": 0.055,
@@ -116,7 +134,7 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
     def classes(self):
         raise NotImplementedError()
 
-    CACHED_SEGMENTATION = "@resegmentation/raw"
+    CACHED_SEGMENTATION = "cache/segmentation/inference"
 
     def apply(
         self,
@@ -145,14 +163,17 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
         hook = self.setup_hook(file, hook=hook)
 
         # apply segmentation model (only if needed)
-        # output shape is (num_chunks, num_frames, num_speakers)
-        if (not self.training) or (
-            self.training and self.CACHED_SEGMENTATION not in file
-        ):
-            file[self.CACHED_SEGMENTATION] = self._segmentation(file)
+        # output shape is (num_chunks, num_frames, local_num_speakers)
+        if self.training:
+            if self.CACHED_SEGMENTATION in file:
+                segmentations = file[self.CACHED_SEGMENTATION]
+            else:
+                segmentations = self._segmentation(file)
+                file[self.CACHED_SEGMENTATION] = segmentations
+        else:
+            segmentations: SlidingWindowFeature = self._segmentation(file)
 
-        segmentations: SlidingWindowFeature = file[self.CACHED_SEGMENTATION]
-        hook("@resegmentation/raw", segmentations)
+        hook("segmentation", segmentations)
 
         # estimate frame-level number of instantaneous speakers
         count = self.speaker_count(
@@ -162,7 +183,7 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
             warm_up=(self.warm_up, self.warm_up),
             frames=self._frames,
         )
-        hook("@resegmentation/count", count)
+        hook("speaker_counting", count)
 
         # discretize original diarization
         # output shape is (num_frames, num_speakers)
@@ -200,7 +221,9 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
         for c, (chunk, segmentation) in enumerate(segmentations):
             local_diarization = diarization.crop(chunk)[np.newaxis, :num_frames]
             (permutated_segmentations[c],), _ = permutate(
-                local_diarization, segmentation, cost_func=mae_cost_func,
+                local_diarization,
+                segmentation,
+                cost_func=mae_cost_func,
             )
         permutated_segmentations = SlidingWindowFeature(
             permutated_segmentations, segmentations.sliding_window
@@ -211,18 +234,21 @@ class Resegmentation(SpeakerDiarizationMixin, Pipeline):
         discrete_diarization = self.to_diarization(permutated_segmentations, count)
 
         # convert to continuous diarization
-        diarization = self.to_annotation(
+        resegmentation = self.to_annotation(
             discrete_diarization,
             min_duration_on=self.min_duration_on,
             min_duration_off=self.min_duration_off,
         )
 
-        diarization.uri = file["uri"]
+        resegmentation.uri = file["uri"]
 
-        if "annotation" in file:
-            diarization = self.optimal_mapping(file["annotation"], diarization)
+        # when reference is available, use it to map hypothesized speakers
+        # to reference speakers (this makes later error analysis easier
+        # but does not modify the actual output of the resegmentation pipeline)
+        if "annotation" in file and file["annotation"]:
+            resegmentation = self.optimal_mapping(file["annotation"], resegmentation)
 
-        return diarization
+        return resegmentation
 
     def get_metric(self) -> GreedyDiarizationErrorRate:
-        return GreedyDiarizationErrorRate(collar=0.0, skip_overlap=False)
+        return GreedyDiarizationErrorRate(**self.der_variant)

@@ -20,12 +20,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from functools import singledispatchmethod
-from typing import Optional
+try:
+    from functools import singledispatchmethod
+except ImportError:
+    from singledispatchmethod import singledispatchmethod
+
+from typing import Dict, List, Optional
 
 import numpy as np
-
-from pyannote.audio.utils.permutation import permutate
 from pyannote.core import (
     Annotation,
     Segment,
@@ -34,7 +36,10 @@ from pyannote.core import (
     Timeline,
 )
 from pyannote.metrics.base import BaseMetric
+from pyannote.metrics.detection import DetectionPrecisionRecallFMeasure
 from pyannote.metrics.diarization import DiarizationErrorRate
+
+from pyannote.audio.utils.permutation import permutate
 
 
 def discrete_diarization_error_rate(reference: np.ndarray, hypothesis: np.ndarray):
@@ -48,7 +53,7 @@ def discrete_diarization_error_rate(reference: np.ndarray, hypothesis: np.ndarra
     hypothesis : (num_frames, num_speakers) np.ndarray
         Discretized hypothesized diarization.
        hypothesis[f, s] = 1 if sth speaker is active at frame f, 0 otherwise
- 
+
     Returns
     -------
     der : float
@@ -104,24 +109,37 @@ class DiscreteDiarizationErrorRate(BaseMetric):
         return ["total", "false alarm", "missed detection", "confusion"]
 
     def compute_components(
-        self, reference, hypothesis, uem: Optional[Timeline] = None,
+        self,
+        reference,
+        hypothesis,
+        uem: Optional[Timeline] = None,
     ):
-        return self.compute_components_helper(hypothesis, reference)
+        return self.compute_components_helper(hypothesis, reference, uem=uem)
 
     @singledispatchmethod
-    def compute_components_helper(self, hypothesis, reference):
+    def compute_components_helper(
+        self, hypothesis, reference, uem: Optional[Timeline] = None
+    ):
         klass = hypothesis.__class__.__name__
         raise NotImplementedError(
             f"Providing hypothesis as {klass} instances is not supported."
         )
 
     @compute_components_helper.register
-    def der_from_ndarray(self, hypothesis: np.ndarray, reference: np.ndarray, **kwargs):
+    def der_from_ndarray(
+        self,
+        hypothesis: np.ndarray,
+        reference: np.ndarray,
+        uem: Optional[Timeline] = None,
+    ):
 
         if reference.ndim != 2:
             raise NotImplementedError(
                 "Only (num_frames, num_speakers)-shaped reference is supported."
             )
+
+        if uem is not None:
+            raise ValueError("`uem` is not supported with numpy arrays.")
 
         ref_num_frames, ref_num_speakers = reference.shape
 
@@ -150,7 +168,10 @@ class DiscreteDiarizationErrorRate(BaseMetric):
 
     @compute_components_helper.register
     def der_from_swf(
-        self, hypothesis: SlidingWindowFeature, reference: Annotation,
+        self,
+        hypothesis: SlidingWindowFeature,
+        reference: Annotation,
+        uem: Optional[Timeline] = None,
     ):
 
         ndim = hypothesis.data.ndim
@@ -177,13 +198,32 @@ class DiscreteDiarizationErrorRate(BaseMetric):
 
         # if (num_frames, num_speakers)-shaped, compute just one DER for the whole file
         if ndim == 2:
-            return self.compute_components_helper(hypothesis.data, reference.data)
+
+            if uem is None:
+                return self.compute_components_helper(hypothesis.data, reference.data)
+
+            if not Timeline([support]).covers(uem):
+                raise ValueError("`uem` must fully cover hypothesis extent.")
+
+            components = self.init_components()
+            for segment in uem:
+                h = hypothesis.crop(segment)
+                r = reference.crop(segment)
+                segment_component = self.compute_components_helper(h, r)
+                for name in self.components_:
+                    components[name] += segment_component[name]
+            return components
 
         # if (num_chunks, num_frames, num_speakers)-shaed, compute one DER per chunk and aggregate
         elif ndim == 3:
 
             components = self.init_components()
             for window, hypothesis_window in hypothesis:
+
+                # Skip any window not fully covered by a segment of the uem
+                if uem is not None and not uem.covers(Timeline([window])):
+                    continue
+
                 reference_window = reference.crop(window, mode="center")
 
                 common_num_frames = min(num_frames, reference_window.shape[0])
@@ -220,7 +260,10 @@ class SlidingDiarizationErrorRate(BaseMetric):
         return ["total", "false alarm", "missed detection", "confusion"]
 
     def compute_components(
-        self, reference, hypothesis, uem: Optional[Timeline] = None,
+        self,
+        reference,
+        hypothesis,
+        uem: Optional[Timeline] = None,
     ):
 
         if uem is None:
@@ -245,3 +288,94 @@ class SlidingDiarizationErrorRate(BaseMetric):
             + components["missed detection"]
             + components["confusion"]
         ) / components["total"]
+
+
+class MacroAverageFMeasure(BaseMetric):
+    """Compute macro-average F-measure
+
+    Parameters
+    ----------
+    collar : float, optional
+        Duration (in seconds) of collars removed from evaluation around
+        boundaries of reference segments (one half before, one half after).
+    beta : float, optional
+        When beta > 1, greater importance is given to recall.
+        When beta < 1, greater importance is given to precision.
+        Defaults to 1.
+
+    See also
+    --------
+    pyannote.metrics.detection.DetectionPrecisionRecallFMeasure
+    """
+
+    def metric_components(self):
+        return self.classes
+
+    @classmethod
+    def metric_name(cls):
+        return "Macro F-measure"
+
+    def __init__(
+        self,
+        classes: List[str],  # noqa
+        collar: float = 0.0,
+        beta: float = 1.0,
+        **kwargs,
+    ):
+        self.metric_name_ = self.metric_name()
+
+        self.classes = classes
+        self.components_ = set(self.metric_components())
+
+        self.collar = collar
+        self.beta = beta
+
+        self._sub_metrics: Dict[str, DetectionPrecisionRecallFMeasure] = {
+            label: DetectionPrecisionRecallFMeasure(collar=collar, beta=beta, **kwargs)
+            for label in self.classes
+        }
+
+        self.reset()
+
+    def reset(self):
+        super().reset()
+        for sub_metric in self._sub_metrics.values():
+            sub_metric.reset()
+
+    def compute_components(
+        self, reference: Annotation, hypothesis: Annotation, uem=None, **kwargs
+    ):
+
+        details = self.init_components()
+        for label, sub_metric in self._sub_metrics.items():
+            details[label] = sub_metric(
+                reference=reference.subset([label]),
+                hypothesis=hypothesis.subset([label]),
+                uem=uem,
+                **kwargs,
+            )
+        return details
+
+    def compute_metric(self, detail: Dict[str, float]):
+        return np.mean(list(detail.values()))
+
+    def report(self, display=False):
+        df = super().report(display=False)
+
+        for label, sub_metric in self._sub_metrics.items():
+            df.loc["TOTAL"][label] = abs(sub_metric)
+
+        if display:
+            print(
+                df.to_string(
+                    index=True,
+                    sparsify=False,
+                    justify="right",
+                    float_format=lambda f: "{0:.2f}".format(f),
+                )
+            )
+
+        return df
+
+    def __abs__(self):
+        return np.mean([abs(sub_metric) for sub_metric in self._sub_metrics.values()])

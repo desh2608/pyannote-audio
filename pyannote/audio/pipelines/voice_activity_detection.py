@@ -25,9 +25,16 @@
 import tempfile
 from copy import deepcopy
 from types import MethodType
-from typing import Union
+from typing import Callable, Optional, Text, Union
 
 import numpy as np
+from pyannote.core import Annotation, SlidingWindowFeature
+from pyannote.database.protocol import SpeakerDiarizationProtocol
+from pyannote.metrics.detection import (
+    DetectionErrorRate,
+    DetectionPrecisionRecallFMeasure,
+)
+from pyannote.pipeline.parameter import Categorical, Integer, LogUniform, Uniform
 from pytorch_lightning import Trainer
 from torch.optim import SGD
 from torch_audiomentations.core.transforms_interface import BaseWaveformTransform
@@ -47,13 +54,6 @@ from pyannote.audio.pipelines.utils import (
 )
 from pyannote.audio.tasks import VoiceActivityDetection as VoiceActivityDetectionTask
 from pyannote.audio.utils.signal import Binarize
-from pyannote.core import Annotation
-from pyannote.database.protocol import SpeakerDiarizationProtocol
-from pyannote.metrics.detection import (
-    DetectionErrorRate,
-    DetectionPrecisionRecallFMeasure,
-)
-from pyannote.pipeline.parameter import Categorical, Integer, LogUniform, Uniform
 
 
 class OracleVoiceActivityDetection(Pipeline):
@@ -90,6 +90,10 @@ class VoiceActivityDetection(Pipeline):
     fscore : bool, optional
         Optimize (precision/recall) fscore. Defaults to optimizing detection
         error rate.
+    use_auth_token : str, optional
+        When loading private huggingface.co models, set `use_auth_token`
+        to True or to a string containing your hugginface.co authentication
+        token that can be obtained by running `huggingface-cli login`
     inference_kwargs : dict, optional
         Keywords arguments passed to Inference.
 
@@ -108,6 +112,7 @@ class VoiceActivityDetection(Pipeline):
         segmentation: PipelineModel = "pyannote/segmentation",
         fscore: bool = False,
         device: str = "cuda",
+        use_auth_token: Union[Text, None] = None,
         **inference_kwargs,
     ):
         super().__init__()
@@ -116,12 +121,15 @@ class VoiceActivityDetection(Pipeline):
         self.fscore = fscore
 
         # load model and send it to GPU (when available and not already on GPU)
-        model = get_model({"checkpoint": segmentation, "map_location": device})
+        model = get_model(
+            {"checkpoint": segmentation, "map_location": device},
+            use_auth_token=use_auth_token,
+        )
 
         inference_kwargs["pre_aggregation_hook"] = lambda scores: np.max(
             scores, axis=-1, keepdims=True
         )
-        self.segmentation_inference_ = Inference(model, **inference_kwargs)
+        self._segmentation = Inference(model, **inference_kwargs)
 
         #  hyper-parameters used for hysteresis thresholding
         self.onset = Uniform(0.0, 1.0)
@@ -156,29 +164,42 @@ class VoiceActivityDetection(Pipeline):
             min_duration_off=self.min_duration_off,
         )
 
-    CACHED_ACTIVATIONS = "@voice_activity_detection/activations"
+    CACHED_SEGMENTATION = "cache/segmentation/inference"
 
-    def apply(self, file: AudioFile) -> Annotation:
+    def apply(self, file: AudioFile, hook: Optional[Callable] = None) -> Annotation:
         """Apply voice activity detection
 
         Parameters
         ----------
         file : AudioFile
             Processed file.
+        hook : callable, optional
+            Hook called after each major step of the pipeline with the following
+            signature: hook("step_name", step_artefact, file=file)
 
         Returns
         -------
-        speech : `pyannote.core.Annotation`
+        speech : Annotation
             Speech regions.
         """
 
-        if self.training:
-            if self.CACHED_ACTIVATIONS not in file:
-                file[self.CACHED_ACTIVATIONS] = self.segmentation_inference_(file)
-        else:
-            file[self.CACHED_ACTIVATIONS] = self.segmentation_inference_(file)
+        # setup hook (e.g. for debugging purposes)
+        hook = self.setup_hook(file, hook=hook)
 
-        speech: Annotation = self._binarize(file[self.CACHED_ACTIVATIONS])
+        # apply segmentation model (only if needed)
+        # output shape is (num_chunks, num_frames, 1)
+        if self.training:
+            if self.CACHED_SEGMENTATION in file:
+                segmentations = file[self.CACHED_SEGMENTATION]
+            else:
+                segmentations = self._segmentation(file)
+                file[self.CACHED_SEGMENTATION] = segmentations
+        else:
+            segmentations: SlidingWindowFeature = self._segmentation(file)
+
+        hook("segmentation", segmentations)
+
+        speech: Annotation = self._binarize(segmentations)
         speech.uri = file["uri"]
         return speech.rename_labels({label: "SPEECH" for label in speech.labels()})
 

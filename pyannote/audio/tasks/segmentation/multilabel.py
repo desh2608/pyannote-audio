@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2020-2021 CNRS
+# Copyright (c) 2020- CNRS
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,30 +20,34 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from typing import List, Optional, Text, Tuple, Union
+import warnings
+from typing import Dict, Optional, Sequence, Text, Tuple, Union, List
 
 import numpy as np
+import torch
+from pyannote.database import Protocol
 from torch_audiomentations.core.transforms_interface import BaseWaveformTransform
+from torchmetrics import Metric
 
 from pyannote.audio.core.task import Problem, Resolution, Specifications, Task
 from pyannote.audio.tasks.segmentation.mixins import SegmentationTaskMixin
-from pyannote.database import Protocol
 
 
-class SpeakerTracking(SegmentationTaskMixin, Task):
-    """Speaker tracking
+class MultiLabelSegmentation(SegmentationTaskMixin, Task):
+    """Generic multi-label segmentation
 
-    Speaker tracking is the process of determining if and when a (previously
-    enrolled) person's voice can be heard in a given audio recording.
+    Multi-label segmentation is the process of detecting temporal intervals 
+    when a specific audio class is active.
 
-    Here, it is addressed with the same approach as voice activity detection,
-    except {"non-speech", "speech"} classes are replaced by {"speaker1", ...,
-    "speaker_N"} where N is the number of speakers in the training set.
+    Example use cases include speaker tracking, gender (male/female)
+    classification, or audio event detection.
 
     Parameters
     ----------
     protocol : Protocol
         pyannote.database protocol
+    classes : List[str], optional
+        List of classes. Defaults to the list of classes available in the training set.
     duration : float, optional
         Chunks duration. Defaults to 2s.
     warm_up : float or (float, float), optional
@@ -70,23 +74,25 @@ class SpeakerTracking(SegmentationTaskMixin, Task):
     augmentation : BaseWaveformTransform, optional
         torch_audiomentations waveform transform, used by dataloader
         during training.
+    metric : optional
+        Validation metric(s). Can be anything supported by torchmetrics.MetricCollection.
+        Defaults to AUROC (area under the ROC curve).
     """
 
-    ACRONYM = "spk"
-
     def __init__(
-        self,
-        protocol: Protocol,
-        duration: float = 2.0,
-        warm_up: Union[float, Tuple[float, float]] = 0.0,
-        balance: Text = None,
-        weight: Text = None,
-        batch_size: int = 32,
-        num_workers: int = None,
-        pin_memory: bool = False,
-        augmentation: BaseWaveformTransform = None,
+            self,
+            protocol: Protocol,
+            classes: Optional[List[str]] = None,
+            duration: float = 2.0,
+            warm_up: Union[float, Tuple[float, float]] = 0.0,
+            balance: Text = None,
+            weight: Text = None,
+            batch_size: int = 32,
+            num_workers: int = None,
+            pin_memory: bool = False,
+            augmentation: BaseWaveformTransform = None,
+            metric: Union[Metric, Sequence[Metric], Dict[str, Metric]] = None,
     ):
-
         super().__init__(
             protocol,
             duration=duration,
@@ -95,41 +101,57 @@ class SpeakerTracking(SegmentationTaskMixin, Task):
             num_workers=num_workers,
             pin_memory=pin_memory,
             augmentation=augmentation,
+            metric=metric,
         )
 
         self.balance = balance
         self.weight = weight
+        self.classes = classes
 
-        # for speaker tracking, task specification depends
-        # on the data: we do not know in advance which
-        # speakers should be tracked. therefore, we postpone
-        # the definition of specifications.
+        # task specification depends on the data: we do not know in advance which
+        # classes should be detected. therefore, we postpone the definition of 
+        # specifications to setup()
 
     def setup(self, stage: Optional[str] = None):
 
         super().setup(stage=stage)
 
+        classes_from_training_set = sorted(self._train_metadata["annotation"])
+        if self.classes is None:
+            classes = classes_from_training_set
+        else:
+            if set(classes_from_training_set) != set(self.classes):
+                warnings.warn(
+                    f"Mismatch between classes passed to the task ({self.classes}) "
+                    f"and those of the training set ({classes_from_training_set})."
+                )
+            classes = self.classes
+
         self.specifications = Specifications(
-            # one class per speaker
-            classes=sorted(self._train_metadata["annotation"]),
-            # multiple speakers can be active at once
+            classes=classes,
             problem=Problem.MULTI_LABEL_CLASSIFICATION,
             resolution=Resolution.FRAME,
             duration=self.duration,
             warm_up=self.warm_up,
         )
 
-    @property
-    def chunk_labels(self) -> List[Text]:
-        """Ordered list of labels
+    def collate_y(self, batch) -> torch.Tensor:
 
-        Used by `prepare_chunk` so that y[:, k] corresponds to activity of kth speaker
-        """
-        return self.specifications.classes
+        labels = self.specifications.classes
 
-    def prepare_y(self, y: np.ndarray) -> np.ndarray:
-        """Get speaker tracking targets"""
-        return y
+        batch_size, num_frames, num_labels = (
+            len(batch),
+            len(batch[0]["y"]),
+            len(labels),
+        )
+        Y = np.zeros((batch_size, num_frames, num_labels), dtype=np.int64)
+
+        for i, b in enumerate(batch):
+            for local_idx, label in enumerate(b["y"].labels):
+                global_idx = labels.index(label)
+                Y[i, :, global_idx] = b["y"].data[:, local_idx]
+
+        return torch.from_numpy(Y)
 
     # TODO: add option to give more weights to smaller classes
     # TODO: add option to balance training samples between classes

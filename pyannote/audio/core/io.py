@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2020-2021 CNRS
+# Copyright (c) 2020- CNRS
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -23,9 +23,8 @@
 """
 # Audio IO
 
-pyannote.audio relies on torchaudio for reading and librosa for resampling.
+pyannote.audio relies on torchaudio for reading and resampling.
 
-We should switch torchaudio resampling as well at some point...
 """
 
 import math
@@ -34,14 +33,11 @@ from io import IOBase
 from pathlib import Path
 from typing import Mapping, Optional, Text, Tuple, Union
 
-import librosa
 import numpy as np
-import torch
 import torch.nn.functional as F
 import torchaudio
-from torch import Tensor
-
 from pyannote.core import Segment
+from torch import Tensor
 
 torchaudio.set_audio_backend("soundfile")
 
@@ -58,6 +54,22 @@ Audio files can be provided to the Audio class using different types:
 For last two options, an additional "channel" key can be provided as a zero-indexed
 integer to load a specific channel: {"audio": "stereo.wav", "channel": 0}
 """
+
+
+def get_torchaudio_info(file: AudioFile):
+    """Protocol preprocessor used to cache output of torchaudio.info
+
+    This is useful to speed future random access to this file, e.g.
+    in dataloaders using Audio.crop a lot....
+    """
+
+    info = torchaudio.info(file["audio"])
+
+    # rewind if needed
+    if isinstance(file["audio"], IOBase):
+        file["audio"].seek(0)
+
+    return info
 
 
 class Audio:
@@ -90,17 +102,16 @@ class Audio:
 
         Parameters
         ----------
-        waveform : (channel, time) Tensor
-            Single or multichannel waveform
-
+        waveform : (..., time) Tensor
+            Waveform(s)
 
         Returns
         -------
-        waveform: (channel, time) Tensor
-            Power-normalized waveform
+        waveform: (..., time) Tensor
+            Power-normalized waveform(s)
         """
-        rms = waveform.square().mean(dim=1).sqrt()
-        return (waveform.t() / (rms + 1e-8)).t()
+        rms = waveform.square().mean(dim=-1, keepdim=True).sqrt()
+        return waveform / (rms + 1e-8)
 
     @staticmethod
     def validate_file(file: AudioFile) -> Mapping:
@@ -162,6 +173,12 @@ class Audio:
 
             file.setdefault("uri", path.stem)
 
+        else:
+
+            raise ValueError(
+                "Neither 'waveform' nor 'audio' is available for this file."
+            )
+
         return file
 
     def __init__(self, sample_rate=None, mono=True):
@@ -194,18 +211,10 @@ class Audio:
 
         # resample
         if (self.sample_rate is not None) and (self.sample_rate != sample_rate):
-            waveform = waveform.numpy()
-            if self.mono:
-                # librosa expects mono audio to be of shape (n,), but we have (1, n).
-                waveform = librosa.core.resample(
-                    waveform[0], sample_rate, self.sample_rate
-                )[None]
-            else:
-                waveform = librosa.core.resample(
-                    waveform.T, sample_rate, self.sample_rate
-                ).T
+            waveform = torchaudio.functional.resample(
+                waveform, sample_rate, self.sample_rate
+            )
             sample_rate = self.sample_rate
-            waveform = torch.tensor(waveform)
 
         return waveform, sample_rate
 
@@ -226,14 +235,19 @@ class Audio:
         file = self.validate_file(file)
 
         if "waveform" in file:
-            return len(file["waveform"].T / file["sample_rate"])
+            frames = len(file["waveform"].T)
+            sample_rate = file["sample_rate"]
 
-        info = torchaudio.info(file["audio"])
+        else:
+            if "torchaudio.info" in file:
+                info = file["torchaudio.info"]
+            else:
+                info = get_torchaudio_info(file)
 
-        if isinstance(file["audio"], IOBase):
-            file["audio"].seek(0)
+            frames = info.num_frames
+            sample_rate = info.sample_rate
 
-        return info.num_frames / info.sample_rate
+        return frames / sample_rate
 
     def __call__(self, file: AudioFile) -> Tuple[Tensor, int]:
         """Obtain waveform
@@ -306,16 +320,18 @@ class Audio:
 
         if "waveform" in file:
             waveform = file["waveform"]
-            sample_rate = file["sample_rate"]
             frames = waveform.shape[1]
+            sample_rate = file["sample_rate"]
+
+        elif "torchaudio.info" in file:
+            info = file["torchaudio.info"]
+            frames = info.num_frames
+            sample_rate = info.sample_rate
 
         else:
-            info = torchaudio.info(file["audio"])
-            sample_rate = info.sample_rate
+            info = get_torchaudio_info(file)
             frames = info.num_frames
-
-            if isinstance(file["audio"], IOBase):
-                file["audio"].seek(0)
+            sample_rate = info.sample_rate
 
         channel = file.get("channel", None)
 
@@ -340,8 +356,8 @@ class Audio:
 
             if end_frame > frames + math.ceil(self.PRECISION * sample_rate):
                 raise ValueError(
-                    f"requested chunk [{segment.start:.6f}, {segment.end:.6f}] ({start_frame:d}:{end_frame:d}) "
-                    f"lies outside of file bounds [0., {frames / sample_rate:.6f}] (0:{frames:d})."
+                    f"requested chunk [{segment.start:.6f}s, {segment.end:.6f}s] (frames #{start_frame:d} to #{end_frame:d}) "
+                    f"lies outside of {file.get('uri', 'in-memory')} file bounds [0., {frames / sample_rate:.6f}s] ({frames:d} frames)."
                 )
             else:
                 end_frame = min(end_frame, frames)
@@ -349,8 +365,8 @@ class Audio:
 
             if start_frame < 0:
                 raise ValueError(
-                    f"requested chunk [{segment.start:.6f}, {segment.end:.6f}] ({start_frame:d}:{end_frame:d}) "
-                    f"lies outside of file bounds [0, {frames / sample_rate:.6f}] (0:{frames:d})."
+                    f"requested chunk [{segment.start:.6f}s, {segment.end:.6f}s] (frames #{start_frame:d} to #{end_frame:d}) "
+                    f"lies outside of {file.get('uri', 'in-memory')} file bounds [0, {frames / sample_rate:.6f}s] ({frames:d} frames)."
                 )
 
         elif mode == "pad":
